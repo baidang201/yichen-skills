@@ -32,6 +32,14 @@ description: |
 6. 用户明确说“群聊摘要、群聊精华、日报、复盘、从上次继续”时，优先用 `vault_cli.py digest-source` 生成素材包，再基于素材写简报；不要把整个 skill 解释成摘要工具。
 7. 用户要求不操作微信界面时，只能使用 `--match-only`、已保存 key、已解密库或本地数据库文件；不要启动 Computer Use。
 
+## 执行前安全检查
+
+- 只读查询（`vault_cli.py status/sessions/history/search/stats/contacts/members/favorites/moments`）不需要关闭微信，只读取已解密 Vault。
+- `extract_keys.py --list-dbs`、`decrypt_all_dbs.py --mode incremental` 和导出报告可以开微信执行；增量刷新如果要拿到刚同步的最新消息，建议先等微信同步，必要时关闭微信后再刷新。
+- `decrypt_all_dbs.py --mode full` 建议先关闭微信，脚本会提示确认，避免读到写入中的数据库快照。
+- `extract_keys.py` 的 Frida spawn/attach 必须在用户明确批准、关闭所有微信实例且用户在场时执行；脚本会提示确认。
+- 高风险脚本支持 `--yes` 跳过确认，仅用于用户已经明确批准且无交互终端的场景。
+
 ## 统一查询入口
 
 日常查询优先使用 `scripts/vault_cli.py`。它只读已解密 vault，不抓 key、不碰微信 UI。

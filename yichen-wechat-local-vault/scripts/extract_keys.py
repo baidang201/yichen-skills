@@ -264,6 +264,15 @@ def run_cmd(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
     return result
 
 
+def confirm_risky_operation(message: str, yes: bool = False) -> None:
+    if yes:
+        return
+    print("\n[PREFLIGHT] " + message)
+    answer = input("  输入 y 继续，其他键取消: ").strip().lower()
+    if answer not in ("y", "yes"):
+        raise SystemExit("已取消，未执行高风险操作")
+
+
 def load_json(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -635,6 +644,7 @@ def main() -> None:
     parser.add_argument("--reuse-log", action="store_true", help="Do not delete /tmp/wechat_frida_keys.log before capture.")
     parser.add_argument("--list-dbs", action="store_true", help="Only print detected database salts.")
     parser.add_argument("--match-only", action="store_true", help="Only match keys from the existing frida log.")
+    parser.add_argument("--yes", action="store_true", help="Skip the preflight confirmation prompt.")
     parser.add_argument("--show-sensitive", action="store_true", help="Show salts/key-adjacent identifiers in terminal output.")
     args = parser.parse_args()
 
@@ -657,6 +667,10 @@ def main() -> None:
 
     copy_path = Path(args.wechat_copy).expanduser()
     if not args.match_only:
+        confirm_risky_operation(
+            "将创建/使用签名微信副本并注入 Frida。请先关闭所有微信实例，并在本机屏幕前准备登录和打开收藏/朋友圈。",
+            args.yes,
+        )
         prepare_wechat(copy_path, args.skip_prepare)
         run_frida_capture(
             mode=args.mode,

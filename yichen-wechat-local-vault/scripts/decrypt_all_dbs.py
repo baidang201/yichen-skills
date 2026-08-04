@@ -60,6 +60,16 @@ def load_config() -> dict:
     return load_json(CONFIG_FILE)
 
 
+def confirm_full_decrypt(yes: bool = False) -> None:
+    if yes:
+        return
+    print("\n[PREFLIGHT] 全量解密会读取微信源数据库并写入本机明文 Vault。")
+    print("  建议先关闭微信，避免读到写入中的数据库快照。")
+    answer = input("  输入 y 继续，其他键取消: ").strip().lower()
+    if answer not in ("y", "yes"):
+        raise SystemExit("已取消，未执行全量解密")
+
+
 def save_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
@@ -220,7 +230,15 @@ def main() -> None:
         action="store_true",
         help="do not write a decrypt manifest",
     )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the full-decrypt preflight confirmation prompt.",
+    )
     args = parser.parse_args()
+
+    if args.mode == "full":
+        confirm_full_decrypt(args.yes)
 
     db_base = resolve_db_base()
     keys = load_json(KEYS_FILE)
