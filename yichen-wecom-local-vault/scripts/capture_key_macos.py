@@ -31,9 +31,28 @@ FRIDA_AGENT = r"""
 'use strict';
 
 const seen = new Set();
-const DBKEY_UPDATE_OFFSET = 0x42f7a4c;
-const GET_ALL_LOCAL_ENCRYPT_KEY_OFFSET = 0x2885074;
-const WXSQLITE_PAGE_CRYPT_OFFSET = 0x278870;
+
+// WeCom 5.0.10 (arm64) wxsqlite3 page codec, verified by static analysis of the
+// on-disk binary (2026-09): the per-page key-derivation entry sits at
+// main_base + 0x280428.  Its prologue is sub sp,sp,#0x90; stp x24,x23,[sp,#0x50];
+// stp x22,x21,[sp,#0x60]; stp x20,x19,[sp,#0x70].  At entry args[3] points to the
+// 16-byte raw database key; the function then builds
+//   raw_key(16) || page_number(LE32) || "sAlT"(4)
+// on the stack and MD5s it (len 0x18) to derive the AES-128 page key, matching
+// wecom_crypto.page_key.  The previous offsets (0x42f7a4c / 0x2885074 /
+// 0x278870) came from an older build and landed on unrelated epilogue code,
+// which is why Interceptor reported "unable to intercept".
+const WXSQLITE_PAGE_DERIVE_OFFSET = 0x280428;
+const WXSQLITE_PAGE_DERIVE_PROLOGUE = 'ff4302d1f85f05a9f65706a9f44f07a9';
+
+// Unique instruction fingerprint inside the same derive function: the page-IV
+// LCG immediate loads (40692/0x9ef4, 52774/0xce26, -3791/-0xecf, 2147483399/
+// 0x7fffffe7 -- the exact constants implemented in wecom_crypto.page_iv).
+// When a WeCom update shifts code around, this lets us re-locate the function
+// at runtime instead of trusting a stale offset.  When execution reaches the
+// match, the raw key copy still sits at [sp] in the derive frame.
+const WXSQLITE_LCG_SIGNATURE = 'c9c49952aac499128cde9352cdd98112eee09f52eeffaf72';
+const WXSQLITE_TEXT_OFFSET = 0x1b000;
 const MAX_REPORTED_CANDIDATES = 8192;
 
 function hex(bytes) {
@@ -77,136 +96,68 @@ function report(pointer, length, source) {
   } catch (_) {}
 }
 
-function readLibcppString(pointer) {
-  if (!pointer || pointer.isNull()) return null;
-  try {
-    const shortSize = pointer.add(23).readU8();
-    if (shortSize > 0 && shortSize <= 23) {
-      return { pointer: pointer, length: shortSize };
-    }
-    const longPointer = pointer.readPointer();
-    const longSize = Number(pointer.add(Process.pointerSize).readU64());
-    if (!longPointer.isNull() && longSize > 0 && longSize <= 4096) {
-      return { pointer: longPointer, length: longSize };
-    }
-  } catch (_) {}
-  return null;
-}
-
 function mainModule() {
   return Process.enumerateModules().find(m => m.path.indexOf('/Contents/MacOS/企业微信') !== -1);
 }
 
-function isPlausiblePointer(pointer) {
-  if (!pointer || pointer.isNull()) return false;
-  try {
-    const value = BigInt(pointer.toString());
-    return value > 0x100000000n && value < 0x800000000000n;
-  } catch (_) {
-    return false;
-  }
-}
-
-function scanLibcppStrings(base, size, source) {
-  if (!base || base.isNull()) return;
-  for (let offset = 0; offset <= size - 24; offset += 8) {
-    try {
-      const value = readLibcppString(base.add(offset));
-      if (value) report(value.pointer, value.length, source + '+str@' + offset);
-    } catch (_) {}
-  }
-}
-
-function scanObject(pointer, source) {
-  if (!isPlausiblePointer(pointer)) return;
-  try {
-    for (let offset = 0; offset <= 512 - 16; offset += 1) {
-      report(pointer.add(offset), 16, source + '+win@' + offset);
-    }
-    scanLibcppStrings(pointer, 512, source);
-  } catch (_) {}
-}
-
-function hookDbKeyManager() {
-  const main = mainModule();
-  if (!main || main.size <= DBKEY_UPDATE_OFFSET) return false;
-  const target = main.base.add(DBKEY_UPDATE_OFFSET);
-  try {
-    Interceptor.attach(target, {
-      onEnter(args) {
-        const oldKey = readLibcppString(args[2]);
-        const newKey = readLibcppString(args[4]);
-        if (oldKey) report(oldKey.pointer, oldKey.length, 'DbKeyManager-old-key');
-        if (newKey) report(newKey.pointer, newKey.length, 'DbKeyManager-new-key');
-      }
-    });
-    send({type: 'hook', name: 'DbKeyManager::UpdateKey'});
-    return true;
-  } catch (error) {
-    send({type: 'agent-error', description: 'DbKeyManager hook failed: ' + error});
-    return false;
-  }
-}
-
-function hookGetAllLocalEncryptKey() {
-  const main = mainModule();
-  if (!main || main.size <= GET_ALL_LOCAL_ENCRYPT_KEY_OFFSET) return false;
-  const target = main.base.add(GET_ALL_LOCAL_ENCRYPT_KEY_OFFSET);
-  try {
-    Interceptor.attach(target, {
-      onEnter(args) {
-        const vector = args[1];
-        try {
-          const begin = vector.readPointer();
-          const end = vector.add(Process.pointerSize).readPointer();
-          const bytes = end.sub(begin).toInt32();
-          const count = bytes / 32;
-          send({type: 'hook-event', name: 'GetAllLocalEncryptKeyCallback', count: count});
-          if (!Number.isInteger(count) || count <= 0 || count > 1000) return;
-          for (let index = 0; index < count; index++) {
-            const item = begin.add(index * 32);
-            report(item, 16, 'GetAllLocalEncryptKey-item' + index + '+0');
-            report(item.add(8), 16, 'GetAllLocalEncryptKey-item' + index + '+8');
-            report(item.add(16), 16, 'GetAllLocalEncryptKey-item' + index + '+16');
-            scanLibcppStrings(item, 32, 'GetAllLocalEncryptKey-item' + index);
-            for (let offset = 0; offset < 32; offset += 8) {
-              try {
-                const pointer = item.add(offset).readPointer();
-                scanObject(pointer, 'GetAllLocalEncryptKey-item' + index + '-ptr' + offset);
-              } catch (_) {}
-            }
-          }
-        } catch (error) {
-          send({type: 'agent-error', description: 'GetAllLocalEncryptKey scan failed: ' + error});
-        }
-      }
-    });
-    send({type: 'hook', name: 'GetAllLocalEncryptKeyCallback'});
-    return true;
-  } catch (error) {
-    send({type: 'agent-error', description: 'GetAllLocalEncryptKey hook failed: ' + error});
-    return false;
-  }
+function readHexAt(pointer, length) {
+  return Array.from(new Uint8Array(pointer.readByteArray(length))).map(b => ('0' + b.toString(16)).slice(-2)).join('');
 }
 
 function hookWxsqlitePageCrypt() {
   const main = mainModule();
-  if (!main || main.size <= WXSQLITE_PAGE_CRYPT_OFFSET) return false;
-  const target = main.base.add(WXSQLITE_PAGE_CRYPT_OFFSET);
+  if (!main) {
+    send({type: 'agent-error', description: 'wxsqlite3 hook: main module not found'});
+    return false;
+  }
+  // Primary: 5.0.10 static offset, only trusted when the on-disk prologue still
+  // matches, so a shifted build can never be hooked blindly (that is exactly
+  // the failure mode that produced "unable to intercept function" before).
+  if (main.size > WXSQLITE_PAGE_DERIVE_OFFSET) {
+    const target = main.base.add(WXSQLITE_PAGE_DERIVE_OFFSET);
+    try {
+      const actual = readHexAt(target, 16);
+      if (actual === WXSQLITE_PAGE_DERIVE_PROLOGUE) {
+        Interceptor.attach(target, {
+          onEnter(args) {
+            // args[3] = pointer to the 16-byte raw database key.
+            report(args[3], 16, 'wxsqlite3-page-raw-key');
+          }
+        });
+        send({type: 'hook', name: 'wxsqlite3-page-raw-key'});
+        return true;
+      }
+      send({type: 'agent-error', description: 'wxsqlite3 offset 0x' + WXSQLITE_PAGE_DERIVE_OFFSET.toString(16) + ' prologue mismatch (' + actual + '); falling back to signature scan'});
+    } catch (error) {
+      send({type: 'agent-error', description: 'wxsqlite3 offset read failed: ' + error + '; falling back to signature scan'});
+    }
+  }
+  // Fallback: locate the derive function by its unique LCG fingerprint inside
+  // __text, then hook the match itself.  At that point the frame still holds
+  // the raw key at [sp] (copied there just before the MD5 call over
+  // key||pageno||"sAlT"), and sp is stable for the rest of the frame.
   try {
-    Interceptor.attach(target, {
-      onEnter(args) {
-        // Internal wxSQLite3 page crypt routine.  The disassembly around
-        // 0x100278870 copies args[3][0..15], appends page number + "sAlT",
-        // and MD5s that buffer to derive the per-page AES key.  args[3] is
-        // therefore the 16-byte raw database key we need to validate.
-        report(args[3], 16, 'wxsqlite3-page-raw-key');
+    const scanSize = Math.min(0x921c774, main.size - WXSQLITE_TEXT_OFFSET);
+    if (scanSize <= WXSQLITE_LCG_SIGNATURE.length / 2) {
+      send({type: 'agent-error', description: 'wxsqlite3 signature scan: __text range unavailable'});
+      return false;
+    }
+    const matches = Memory.scanSync(main.base.add(WXSQLITE_TEXT_OFFSET), scanSize, WXSQLITE_LCG_SIGNATURE);
+    if (!matches.length) {
+      send({type: 'agent-error', description: 'wxsqlite3 page derive not found (signature miss); WeCom build changed, re-derive offsets'});
+      return false;
+    }
+    Interceptor.attach(matches[0].address, {
+      onEnter(_args) {
+        try {
+          report(this.context.sp, 16, 'wxsqlite3-page-raw-key-scan');
+        } catch (_) {}
       }
     });
-    send({type: 'hook', name: 'wxsqlite3-page-raw-key'});
+    send({type: 'hook', name: 'wxsqlite3-page-raw-key (sigscan)'});
     return true;
   } catch (error) {
-    send({type: 'agent-error', description: 'wxsqlite3 page crypt hook failed: ' + error});
+    send({type: 'agent-error', description: 'wxsqlite3 signature scan failed: ' + error});
     return false;
   }
 }
@@ -228,6 +179,13 @@ function hook(name, callbacks) {
   send({type: 'hook', name: name});
   return true;
 }
+
+// Note: the old DbKeyManager::UpdateKey / GetAllLocalEncryptKey fixed-offset
+// hooks were removed.  Their offsets (0x42f7a4c / 0x2885074) pointed at
+// unrelated code in 5.0.10 (function epilogues), so Interceptor failed with
+// "unable to intercept function".  The wxsqlite3 page-derive hook below is a
+// superset: it captures the same raw key on every page turn of any encrypted
+// database, without needing those higher-level call sites.
 
 hook('CC_MD5', {
   onEnter(args) {
@@ -290,8 +248,6 @@ hook('sqlite3_rekey_v2', {
   }
 });
 
-hookDbKeyManager();
-hookGetAllLocalEncryptKey();
 hookWxsqlitePageCrypt();
 
 send({type: 'ready'});
@@ -483,6 +439,7 @@ def capture(args: argparse.Namespace) -> int:
     if args.mode == "attach":
         pid = args.pid or find_pid()
         print(f"只读附加企业微信进程 PID={pid}，最长等待 {args.duration} 秒。")
+        print("密钥在数据库页面读写时出现；如长时间无候选，请在企微里切换会话或刷新消息列表。")
     else:
         if not args.confirm_signed_copy:
             raise SystemExit("spawn-signed-copy 必须显式添加 --confirm-signed-copy")
