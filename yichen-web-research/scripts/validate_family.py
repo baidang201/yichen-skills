@@ -72,14 +72,24 @@ def check_doctor() -> dict:
     except json.JSONDecodeError as exc:
         return {"ok": False, "error": f"invalid doctor JSON: {exc}"}
 
+    zhihu = payload.get("zhihu", {})
+    firecrawl = payload.get("web", {}).get("firecrawl", {})
     invariants = {
-        "xiaohongshu_authorization": payload.get("xiaohongshu", {}).get(
+        "xiaohongshu_bounded_readonly_reuse": payload.get("xiaohongshu", {}).get(
             "current_turn_authorization_required"
         )
+        is False,
+        "douyin_bounded_readonly_reuse": payload.get("douyin", {}).get(
+            "current_turn_authorization_required"
+        )
+        is False,
+        "xiaohongshu_dangerous_scope_still_requires_authorization": payload.get(
+            "xiaohongshu", {}
+        ).get("write_or_private_scope_authorization_required")
         is True,
-        "douyin_authorization": payload.get("douyin", {}).get(
-            "current_turn_authorization_required"
-        )
+        "douyin_dangerous_scope_still_requires_authorization": payload.get(
+            "douyin", {}
+        ).get("write_or_private_scope_authorization_required")
         is True,
         "toutiao_anonymous": payload.get("toutiao", {}).get(
             "login_required_for_search"
@@ -101,9 +111,9 @@ def check_doctor() -> dict:
             "status"
         )
         in {"ok", "warn"},
-        "x_search_primary_is_grok": (
+        "x_search_contract_is_grok_first": (
             payload.get("twitter", {}).get("active_backend")
-            == "official_cli_account_quota"
+            in {None, "official_cli_account_quota"}
             and payload.get("twitter", {}).get("primary_login_required") is True
             and payload.get("twitter", {}).get("search_route", [None])[0]
             == "official_cli_account_quota"
@@ -122,6 +132,27 @@ def check_doctor() -> dict:
             "billing_status"
         )
         in {"unknown", "unknown_requires_console_login"},
+        "firecrawl_adapter_present": firecrawl.get("adapter_ready") is True,
+        "firecrawl_is_explicit_and_offline": (
+            firecrawl.get("default_backend") is False
+            and firecrawl.get("network_probe_performed") is False
+            and firecrawl.get("credential_source")
+            in {None, "environment", "private_file"}
+        ),
+        "zhihu_adapter_present": zhihu.get("adapter_ready") is True,
+        "zhihu_cli_or_auth_missing_is_nonfatal": (
+            zhihu.get("status") in {"ok", "warn"}
+            and isinstance(zhihu.get("cli_ready"), bool)
+            and isinstance(zhihu.get("auth_configured"), bool)
+        ),
+        "zhihu_keychain_source_only": zhihu.get("credential_source")
+        in {None, "keychain"},
+        "zhihu_offline_explicit_public_only": (
+            zhihu.get("network_probe_performed") is False
+            and zhihu.get("default_backend") is False
+            and zhihu.get("public_commands_only") is True
+            and zhihu.get("personal_commands_exposed") is False
+        ),
     }
     return {
         "ok": all(invariants.values()),
@@ -166,26 +197,34 @@ def main() -> int:
         if not no_template:
             failures.append(f"{name}: template marker remains")
 
-        validation = (
-            run([sys.executable, str(VALIDATOR), str(root)])
-            if VALIDATOR.is_file()
-            else None
-        )
-        valid = validation is None or validation.returncode == 0
-        checks[f"{name}.quick_validate"] = valid
-        if not valid:
-            failures.append(
-                f"{name}: quick_validate failed: "
-                f"{validation.stdout.strip()} {validation.stderr.strip()}"
-            )
+        if VALIDATOR.is_file():
+            validation = run([sys.executable, str(VALIDATOR), str(root)])
+            valid = validation.returncode == 0
+            checks[f"{name}.quick_validate"] = {
+                "status": "passed" if valid else "failed",
+                "returncode": validation.returncode,
+            }
+            if not valid:
+                failures.append(
+                    f"{name}: quick_validate failed: "
+                    f"{validation.stdout.strip()} {validation.stderr.strip()}"
+                )
+        else:
+            checks[f"{name}.quick_validate"] = {
+                "status": "skipped",
+                "reason": "external quick_validate.py is not installed",
+            }
 
     test_commands = {
         "yichen-web-research": [
             sys.executable,
-            str(
-                SKILLS_ROOT
-                / "yichen-web-research/tests/test_router_contract.py"
-            ),
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            str(SKILLS_ROOT / "yichen-web-research/tests"),
+            "-p",
+            "test_*.py",
         ],
         "yichen-unified-search": [
             sys.executable,
@@ -322,6 +361,20 @@ def main() -> int:
     router_source = (
         SKILLS_ROOT / "yichen-web-research/SKILL.md"
     ).read_text(encoding="utf-8")
+    hengzong_scripts = {
+        name: SKILLS_ROOT / "yichen-web-research/scripts" / name
+        for name in (
+            "plan_hengzong_research.py",
+            "assemble_hengzong_evidence.py",
+        )
+    }
+    hengzong_forbidden_markers = (
+        "import requests",
+        "from requests",
+        "urllib.request",
+        "import httpx",
+        "opencli ",
+    )
     router_metadata_checks = {
         "english_trigger_present": "Use when an internet-research request"
         in router_source,
@@ -334,20 +387,179 @@ def main() -> int:
                 "yichen-asr",
             )
         ),
-        "legacy_references_removed": not (
-            SKILLS_ROOT / "yichen-web-research/references"
-        ).exists(),
-        "router_scripts_are_thin": {
+        "hengzong_reference_is_single_bounded_protocol": {
+            path.name
+            for path in (
+                SKILLS_ROOT / "yichen-web-research/references"
+            ).glob("*")
+            if path.is_file()
+        }
+        == {"hengzong-research.md"},
+        "router_scripts_are_bounded": {
             path.name
             for path in (
                 SKILLS_ROOT / "yichen-web-research/scripts"
             ).glob("*.py")
         }
-        == {"doctor_yichen.py", "validate_family.py"},
+        == {
+            "assemble_hengzong_evidence.py",
+            "doctor_yichen.py",
+            "plan_hengzong_research.py",
+            "validate_family.py",
+        },
+        "hengzong_scripts_are_offline": all(
+            path.is_file()
+            and all(
+                marker not in path.read_text(encoding="utf-8")
+                for marker in hengzong_forbidden_markers
+            )
+            for path in hengzong_scripts.values()
+        ),
+        "zhihu_adapter_present": (
+            SKILLS_ROOT
+            / "yichen-unified-search/scripts/zhihu_adapter.py"
+        ).is_file(),
     }
     checks["router_metadata"] = router_metadata_checks
     if not all(router_metadata_checks.values()):
-        failures.append("router metadata or thin-router structure is incomplete")
+        failures.append("router metadata or bounded research structure is incomplete")
+
+    hengzong_reference = (
+        SKILLS_ROOT
+        / "yichen-web-research/references/hengzong-research.md"
+    ).read_text(encoding="utf-8")
+    planner_source = hengzong_scripts[
+        "plan_hengzong_research.py"
+    ].read_text(encoding="utf-8")
+    assembler_source = hengzong_scripts[
+        "assemble_hengzong_evidence.py"
+    ].read_text(encoding="utf-8")
+    hengzong_contract_checks = {
+        "archive_is_explicit_conditional_branch": (
+            "仅在用户明确要求归档且范围已限定时" in router_source
+            and "搜索结束后不得自动归档或下载" in router_source
+            and "只有用户明确要求持久化原文或下载媒体" in router_source
+        ),
+        "workstreams_have_bounded_scope_query_groups": all(
+            marker in planner_source
+            for marker in (
+                '"query_groups"',
+                '"coverage_dimensions"',
+                '"geography_requirements"',
+                '"language_requirements"',
+                "MAX_QUERY_GROUPS_PER_WORKSTREAM",
+                '"subject_localization_status"',
+                '"geography_localization_status"',
+                '"geography_localization_gap"',
+            )
+        ) and all(
+            marker in hengzong_reference
+            for marker in (
+                "每个 workstream 都必须有自己的 `query_groups`",
+                "blocking gap",
+                "`retained_gaps`",
+                "temporal-eligible verified source",
+                "`query_text` 必须是",
+                "`localization_status=native`",
+            )
+        ) and all(
+            marker in assembler_source
+            for marker in (
+                '"geographies": geographies',
+                '"languages": languages',
+                "dimension_counts",
+                "missing_dimensions",
+            )
+        ),
+        "plan_and_evidence_are_fail_closed": all(
+            marker in assembler_source
+            for marker in (
+                "canonical hash of the current plan body",
+                "bundle.plan_id must be present and exactly match canonical plan.plan_id",
+                "Envelope research_context plan_id must be present and match exactly",
+                "plan.brief.start_date",
+                "plan.brief.as_of",
+                "Supporting and contradicting evidence links require a non-empty locator",
+                "Supporting and contradicting evidence links require event_date",
+                "Supporting and contradicting evidence links require scope",
+                '"event_date": event_date',
+                '"scope": scope',
+                '"notes": notes',
+                "independence_group",
+                "retrospective",
+                "base_claims_complete",
+                "timeline_ready",
+                "cross_sectional_ready",
+                'status = "contested"',
+            )
+        ) and all(
+            marker in planner_source
+            for marker in (
+                '"source_annotation_fields"',
+                '"geographies"',
+                '"languages"',
+                '"retrospective"',
+                '"evidence_link_requirements"',
+                '"supports_or_contradicts"',
+                '"event_date"',
+                '"scope"',
+                '"notes"',
+            )
+        ),
+        "retained_disclosure_is_bounded": all(
+            marker in assembler_source
+            for marker in (
+                "retained_gaps",
+                "query_or_path",
+                "distinct query_or_path and route values",
+                "bounded_conclusion",
+                'status = "blocking"',
+                '"ready_with_disclosure"',
+            )
+        ) and all(
+            marker in planner_source
+            for marker in (
+                '"retained_gap_contract"',
+                '"query_or_path"',
+                '"route"',
+                '"minimum_items"',
+            )
+        ) and all(
+            marker in hengzong_reference
+            for marker in (
+                "至少 2 条结构化 `search_attempts`",
+                "各条 query/path 彼此不同、route 也彼此不同",
+                "Retained disclosure 只改变",
+                "任一结构门失败仍为 `blocking`",
+            )
+        ),
+        "opportunity_and_language_are_report_contracts": all(
+            marker in planner_source
+            for marker in (
+                '"opportunity_map"',
+                '"opportunity_id"',
+                '"delivery_languages"',
+                '"required_sections"',
+            )
+        ) and all(
+            marker in assembler_source
+            for marker in (
+                "opportunity_map_ready",
+                "nonempty_opportunity_map_required_by_plan",
+                "opportunity_evidence_basis_requires_ready_claim_ids",
+                "opportunity_requires_longitudinal_and_cross_sectional_ready_base_claims",
+            )
+        ) and all(
+            marker in hengzong_reference
+            for marker in (
+                "`report_contract` 必须显式要求非空 `opportunity_map`",
+                "`report_contract.language_requirements.delivery_languages` 必须同时列出两种语言",
+            )
+        ),
+    }
+    checks["hengzong_contract"] = hengzong_contract_checks
+    if not all(hengzong_contract_checks.values()):
+        failures.append("horizontal/longitudinal research contract markers are incomplete")
 
     boundary_sources = {
         "search": (
@@ -382,6 +594,17 @@ def main() -> int:
             and "明确额度耗尽" in boundary_sources["search"]
             and "FxTwitter" in boundary_sources["search"]
         ),
+        "firecrawl_is_explicit_and_bounded": (
+            "不进入默认搜索链" in router_source
+            and "同源" in router_source
+            and "最多 100 条" in router_source
+            and "Firecrawl" in boundary_sources["search"]
+        ),
+        "zhihu_is_explicit_public_only": (
+            "显式 `zhihu` 平台后端" in router_source
+            and "global_search" in router_source
+            and "zhihu_adapter.py" in boundary_sources["search"]
+        ),
         "bookmarks_requires_current_turn_authorization": "当轮授权"
         in boundary_sources["bookmarks"],
         "bookmarks_does_not_download": "不得下载媒体"
@@ -393,6 +616,10 @@ def main() -> int:
         "single_stage_multiplatform_search_goes_direct": (
             "单阶段搜索无论涉及一个还是多个平台"
             in router_source
+        ),
+        "search_completion_does_not_authorize_archive": (
+            "搜索完成本身绝不转移归档授权" in router_source
+            and "仅在用户明确要求归档且范围已限定时" in router_source
         ),
         "public_opinion_excludes_generic_search": (
             not (SKILLS_ROOT / "public-opinion-monitor/SKILL.md").is_file()
